@@ -60,31 +60,6 @@ def smape(
 
 
 def quantile_loss(
-    preds:     np.ndarray,             # [B, T, H, C, Q]
-    targets:   np.ndarray,             # [B, T, H, C]
-    quantiles: list[float],
-    mask:      np.ndarray | None = None,  # [B, T, H, C]
-) -> float:
-    """
-    quantile_loss() returns the *mean pinball loss* across quantiles:
-    QL = (1 / Q) * Σ_q L_q(y, ŷ_q)
-
-    where L_q is the pinball loss:
-
-        L_q(y, ŷ) = (y - ŷ) * q         if y >= ŷ
-                  = (ŷ - y) * (1 - q)    if y <  ŷ
-    """
-        
-    errors = targets[..., np.newaxis] - preds          # [B, T, H, C, Q]
-    q      = np.array(quantiles, dtype=preds.dtype)    # [Q]
-    loss   = np.maximum(q * errors, (q - 1) * errors)  # [B, T, H, C, Q]
-
-    if mask is not None:
-        mask = np.broadcast_to(mask[..., np.newaxis], loss.shape)
-        return (loss * mask).sum() / max(mask.sum(), 1)
-    return loss.mean()
-
-def quantile_loss(
     preds, 
     targets, 
     quantiles, 
