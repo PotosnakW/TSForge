@@ -122,21 +122,21 @@ def excess_volatility(targets, preds, quantiles, stride=1, scaling=True, mask=No
         quantiles=quantiles, 
         mask=pair_mask,
         aggregate=None,
-    )
+    ) / Q # scale by quantiles
     accuracy_before = quantile_loss(
         preds=y_hat_before, 
         targets=reshaped_y, 
         quantiles=quantiles, 
         mask=pair_mask,
         aggregate=None,
-    )
+    ) / Q  # scale by quantiles
     accuracy_update = quantile_loss(
         preds=y_hat_update, 
         targets=reshaped_y, 
         quantiles=quantiles, 
         mask=pair_mask,
         aggregate=None,
-    )
+    ) / Q  # scale by quantiles
 
     EV = (revision_cost - (accuracy_before - accuracy_update)).sum()
     denom = np.sum(np.abs(reshaped_y) * pair_mask) + 1e-8 if mask is not None else np.sum(np.abs(reshaped_y)) + 1e-8
