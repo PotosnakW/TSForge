@@ -75,17 +75,20 @@ def quantile_loss(
         L_q(y, ŷ) = (y - ŷ) * q         if y >= ŷ
                   = (ŷ - y) * (1 - q)    if y <  ŷ
     """
-    errors = targets[..., np.newaxis] - preds
-    q      = np.array(quantiles, dtype=preds.dtype)
-    loss   = np.maximum(q * errors, (q - 1) * errors)
 
+    if targets.ndim < preds.ndim:
+        errors = targets[..., np.newaxis] - preds # point target
+    else:
+        errors = targets - preds # per-quantile pairing
+ 
+    q = np.array(quantiles, dtype=preds.dtype)
+    loss = np.maximum(q * errors, (q - 1) * errors)
+ 
     if mask is not None:
         mask = np.broadcast_to(mask[..., np.newaxis], loss.shape)
         loss = loss * mask
-    
     if aggregate == 'mean':
         return loss.sum() / max(mask.sum(), 1) if mask is not None else loss.mean()
-    
     return loss  # aggregate=None, return per-element
 
 
