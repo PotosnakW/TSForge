@@ -59,7 +59,7 @@
 ### 1. Install
 ```bash
 git clone git@github.com:PotosnakW/ForgeTS.git
-cd forgets
+cd ForgeTS
 pip install -e .
 ```
 
@@ -73,14 +73,14 @@ configs/
     sources/
       simglucose.yaml   # dataset config (path, horizon, val_size, exog_cols, etc.)
   model/
-    tstmomentmica.yaml  # model architecture config
+    patchtstmica.yaml   # model architecture config
   config.yaml           # top-level defaults
 ```
 
 ### 3. Run Experiment
 ```bash
 cd experiments
-python train_models.py dataset=simglucose model=tstmomentmica
+python train_model.py dataset=simglucose model=patchtstmica
 ```
 
 <br>
@@ -96,12 +96,12 @@ python train_models.py dataset=simglucose model=tstmomentmica
 
 ## Modular Model Build
 
-When adding a model config file in `config/models/`, select encoder, decoder, and output layer.
+When adding a model config file in `configs/model/`, select encoder, decoder, and output layer.
 Any component can be set to `none` to skip it.
 ```yaml
 d_model: 256
-encoder: patchtst      # or none
-decoder: none          # or transformer, google/t5-efficient-tiny, etc.
+encoder: patchtst      # or rnn, lstm, cnn, none
+decoder: none          # only none is currently supported
 output_layer: linear_proj  # or none
 ```
 
@@ -113,7 +113,7 @@ output_layer: linear_proj  # or none
 ### Supported Input Layers
 | `input_layer` | Key config params | Notes |
 |---|---|---|
-| `linear` | `dropout`, `positional_encoding` | Linear projection with optional positional encodings and dropout |
+| `linear_proj` | `dropout`, `positional_encoding` | Linear projection with optional positional encodings and dropout |
 | `none` | — | No input layer — raw tokens passed directly to encoder |
  
 ### Supported Encoders
@@ -151,7 +151,6 @@ output_layer: linear_proj  # or none
 
 ## Dataloaders
 
-
 ### DataLoaderFactory
 
 Central object that owns all dataset construction and dataloader creation.
@@ -165,18 +164,21 @@ test_loaders = factory.test_dataloaders()
 
 <br>
 
-### FullSeriesDataset
+### FullSeriesDataset vs. PerSeriesDataset
 
-Each dataset is a single item (`__len__ == 1`) — the entire series delivered to the model in one shot. `fork_sequences` handles all windowing inside `_prepare_batch`.
+Which class backs a source is driven by its `multivariate` flag in `source/{dataset}` config.
+
+| | `multivariate: true` → `FullSeriesDataset` | `multivariate: false` → `PerSeriesDataset` |
+|---|---|---|
+| `__len__` | `1` — all channels share one aligned time axis | Number of series in the entry — each independent, own native length |
+| Windowing | `fork_sequences` handles all windowing inside `_prepare_batch` | Same, per series |
+| Alignment | Channels pre-aligned on shared dates | No cross-series date alignment; left-padded to a common length in the collate_fn |
 
 <br>
 
-
-
 ### `batch_sampler: HorizonBatchSampler`
 
-Groups datasets by `(horizon, is_multivariate)` so all items in a batch share the same forecast length and data type. When `horizon_override` is set, all datasets collapse into a single group per multivariate flag, allowing free mixing across horizons. Univariate and multivariate datasets are always batched separately and never mixed within a batch. Ensure the `multivariate` flag is set correctly in each `source/{dataset}` config.
-
+Groups datasets by `(horizon, is_multivariate)` so all items in a batch share the same forecast length and data type. When `horizon_override` is set, all datasets collapse into a single group per multivariate flag, allowing free mixing across horizons. Univariate and multivariate datasets are always batched separately and never mixed within a batch.
 
 | `batch_mixing_strategy` | Behaviour |
 |---|---|
@@ -206,16 +208,13 @@ Forking-sequences architectures generate forecasts for all FCDs simultaneously b
   <em>(a) Window-Sampling &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (b) Forking-Sequences</em>
 </p>
 
-
-
-
-The `fcd_sample` parameter in the `configs/base/default.yaml` file. It can alternatively be specified in individual model configs in `configs/models/`
+The `fcd_samples` parameter is set in the `configs/base/default.yaml` file. It can alternatively be specified in individual model configs in `configs/model/`.
 
 ```python
-from dataloaders._forking_sequences import ForkingSequences
+from forgets.dataloaders._forking_sequences import ForkingSequences
 
 # Training — sample FCDs per series
-fs_call = ForkingSequences(context_length=512)
+fs_call = ForkingSequences(context_len=512)
 out = fs_call(batch, fcd_samples=4, horizon=6)
 # Training — Use all FCDs per series
 out = fs_call(batch, fcd_samples=-1, horizon=6)
@@ -223,7 +222,6 @@ out = fs_call(batch, fcd_samples=-1, horizon=6)
 # Val / Test — all valid windows, no sampling
 out = fs_call(batch, fcd_samples=-1, horizon=6)
 ```
-
 
 <br>
 
@@ -282,7 +280,7 @@ series 3   [0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1]
 
 ### Single GPU
 ```python
-from common.train import train
+from forgets.common.train import train
 
 train(model, mcfg, train_loader, val_loaders, device=torch.device("cuda"))
 
@@ -299,7 +297,7 @@ torchrun --nproc_per_node=4 train_script.py
 
 **mp.spawn** (programmatic, single-machine):
 ```python
-from common.train import train_distributed
+from forgets.common.train import train_distributed
 
 train_distributed(model, mcfg, factory, use_spawn=True, world_size=4)
 ```
@@ -319,7 +317,7 @@ For datasets too large to fit in RAM, `write_sharded_dataset` partitions data in
 #### Writing Shards
 
 ```python
-from dataloaders.ts_sharding import write_sharded_dataset
+from forgets.dataloaders.ts_sharding import write_sharded_dataset
 
 write_sharded_dataset(
     df             = full_df,           # long-format DataFrame — must have 'available_mask'
@@ -385,9 +383,9 @@ Select the loss via `mcfg.loss`:
 All point-forecast losses share the same signature:
 ```python
 loss_fn(
-    preds:   torch.Tensor,         # [B, H, C]
-    targets: torch.Tensor,         # [B, H, C]
-    mask:    torch.Tensor | None,  # [B, H, C]  1=real, 0=padded/missing
+    preds:   torch.Tensor,         # [B, T, H, C]
+    targets: torch.Tensor,         # [B, T, H, C]
+    mask:    torch.Tensor | None,  # [B, T, H, C]  1=real, 0=padded/missing
 ) -> torch.Tensor                  # scalar
 ```
 
@@ -402,7 +400,7 @@ When `mask is None` a plain `.mean()` is used — equivalent to a mask of all on
 
 ### Accuracy Metrics
 ```python
-from common.losses_np import mae, mse, rmse, mape, smape
+from forgets.metrics.eval_losses import mae, mse, rmse, mape, smape
 ```
 
 | Function | Formula |
@@ -412,13 +410,9 @@ from common.losses_np import mae, mse, rmse, mape, smape
 | `rmse`  | `sqrt( mse )` |
 | `mape`  | `mean( \|y − ŷ\| / \|y\| ) × 100` |
 | `smape` | `mean( 2\|y − ŷ\| / (\|y\| + \|ŷ\|) ) × 100` |
-```python
-metric_fn(
-    preds:   np.ndarray,        # [..., H, C]
-    targets: np.ndarray,        # [..., H, C]
-    mask:    np.ndarray | None, # [..., H, C]  1=real, 0=missing
-) -> float
-```
+
+Same `(preds, targets, mask)` signature as the training losses above, but on `np.ndarray` and returning a Python `float`.
+
 ```python
 preds   = results["simglucose"]["preds"].numpy()           # [n_fcds, H, C]
 targets = results["simglucose"]["targets"].numpy()         # [n_fcds, H, C]
@@ -443,7 +437,7 @@ print("RMSE:", rmse(preds, targets, mask))
 Stability metrics operate on the overlapping structure of forking sequences — multiple forecast windows predict the same target date from different horizons, so revisions across consecutive windows can be measured directly. Lower measurements are preferred.
 
 ```python
-from common.losses_np import excess_volatility, forecast_percentage_change
+from forgets.metrics.stability_metrics import excess_volatility, forecast_percentage_change
 ```
 
 #### Excess Volatility (EV)
@@ -464,7 +458,7 @@ ev = excess_volatility(
     targets=targets, # [B, T, H, C]
     preds=preds, # [B, T, H, C, Q]
     quantiles=mcfg.quantiles, # [Q]
-    mask=mask, # [B, C, H]
+    mask=mask, # [B, T, H, C]
     scaling=True,
 )
 ```
@@ -476,9 +470,9 @@ Measures the relative magnitude of revisions without reference to ground truth. 
 
 ```python
 sfpc = forecast_percentage_change(
-    preds=p_median, # [B, T, H, C, Q]
-    mask=mask, # [B, C, H]
-    scaling=True,
+    preds=p_median, # [B, T, H, C]
+    mask=mask, # [B, T, H, C]
+    symmetric=True,
 )
 ```
 
@@ -546,27 +540,18 @@ Returns a nested dict keyed by dataset name:
  
 
 ## Forecast Ensembling
-Because forking sequences produce multiple overlapping predictions for anygiven future timestep, ensembling these overlaps can meaningfully reduce
-variance before computing final metrics.
+Forking sequences produce multiple overlapping predictions for any given future timestep; ensembling these overlaps can meaningfully reduce variance before computing final metrics.
 
 <p align="center">
   <img src="figures/available_forecast.png" alt="grid" width="250"/>
   <img src="figures/forecast_variance.png" alt="second" width="250"/>
 </p>
 Fig. a) We adapt forking-sequences during inference to ensemble multiple forecasts of the same future date by
-computing a function (ex., moving average) across predictions generated from previous FCDs. b) Forking-sequences
-ensembling improves forecasts’ stability, reducing the estimators variance with a linear convergence rate analogous to
-the weak law of large numbers.
+computing a function (e.g., moving average) across predictions generated from previous FCDs. b) Ensembling
+improves forecast stability, reducing estimator variance with a linear convergence rate analogous to the weak
+law of large numbers.
 
-<br>
-
-```python
-from common.ensembling import Ensembler
-
-ensembler = Ensembler(ensemble_method='mean')
-smoothed  = ensembler.ensemble(preds, mask=outsample_mask)
-# [B, T, H, C]  →  [B, T, H, C]
-```
+> See [`notebooks/tsfm_ensembling_demo.ipynb`](notebooks/tsfm_ensembling_demo.ipynb) for a full worked example regarding forecast ensembling with pretrained time series foundation models.
 
 ### Methods
 
@@ -580,25 +565,6 @@ smoothed  = ensembler.ensemble(preds, mask=outsample_mask)
 `window_size=None` uses all available overlapping windows. Set an integer
 to limit aggregation to the N most recent overlaps.
 
-### Masking
-
-Pass `outsample_mask` directly — masked timesteps (`0`) are treated as
-`NaN` internally and excluded from every aggregation operation, so padded
-channels and missing values never contaminate the ensemble.
-
-### Typical Usage
-```python
-results = eval_test(model, factory, device=torch.device("cuda"))
-
-preds = results["simglucose"]["preds"].numpy()           # [n_fcds, H, C]
-mask  = results["simglucose"]["outsample_mask"].numpy()  # [n_fcds, H, C]
-
-# Ensembler expects [B, T, H, C] — add batch dim
-ensembler = Ensembler(ensemble_method='ewm', alpha=0.3)
-smoothed  = ensembler.ensemble(preds[None], mask=mask[None])[0]  # [n_fcds, H, C]
-
-print("Ensemble MAE:", mae(smoothed, targets, mask))
-```
 
 <br>
 
