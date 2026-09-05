@@ -8,11 +8,11 @@ import yaml
 from pathlib import Path
 import pickle
 
-from forgets.models.transformer import Transformer
-from forgets.models.rnn import RNN
-from forgets.models.cnn import CNN
-from forgets.dataloaders.factory import DataLoaderFactory
-from forgets.common.train import train, eval_test
+from tsforge.models.transformer import Transformer
+from tsforge.models.rnn import RNN
+from tsforge.models.cnn import CNN
+from tsforge.dataloaders.factory import DataLoaderFactory
+from tsforge.common.train import train, eval_test
 
 logging.basicConfig(
     level=logging.INFO,

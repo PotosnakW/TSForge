@@ -1,7 +1,7 @@
 <a name="top"></a>
 
 <p align="center">
-  <img src="figures/ForgeTS_logo.jpg" width="250"/>
+  <img src="figures/TSForge_logo.png" width="250"/>
   </p>
 
 
@@ -42,10 +42,10 @@
 
 ## Overview
 
-**Most forecasting codebases benchmark at the model level. ForgeTS benchmarks at the component level.**
+**Most forecasting codebases benchmark at the model level. TSForge benchmarks at the component level.**
 
 <p align="center">
-  <img src="figures/ForgeTS_motivation.jpg" width="720"/>
+  <img src="figures/TSForge_motivation.jpg" width="720"/>
 </p>
 
 <br>
@@ -58,8 +58,8 @@
 
 ### 1. Install
 ```bash
-git clone git@github.com:PotosnakW/ForgeTS.git
-cd ForgeTS
+git clone git@github.com:PotosnakW/TSForge.git
+cd TSForge
 pip install -e .
 ```
 
@@ -211,7 +211,7 @@ Forking-sequences architectures generate forecasts for all FCDs simultaneously b
 The `fcd_samples` parameter is set in the `configs/base/default.yaml` file. It can alternatively be specified in individual model configs in `configs/model/`.
 
 ```python
-from forgets.dataloaders._forking_sequences import ForkingSequences
+from tsforge.dataloaders._forking_sequences import ForkingSequences
 
 # Training — sample FCDs per series
 fs_call = ForkingSequences(context_len=512)
@@ -280,7 +280,7 @@ series 3   [0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1]
 
 ### Single GPU
 ```python
-from forgets.common.train import train
+from tsforge.common.train import train
 
 train(model, mcfg, train_loader, val_loaders, device=torch.device("cuda"))
 
@@ -297,7 +297,7 @@ torchrun --nproc_per_node=4 train_script.py
 
 **mp.spawn** (programmatic, single-machine):
 ```python
-from forgets.common.train import train_distributed
+from tsforge.common.train import train_distributed
 
 train_distributed(model, mcfg, factory, use_spawn=True, world_size=4)
 ```
@@ -317,7 +317,7 @@ For datasets too large to fit in RAM, `write_sharded_dataset` partitions data in
 #### Writing Shards
 
 ```python
-from forgets.dataloaders.ts_sharding import write_sharded_dataset
+from tsforge.dataloaders.ts_sharding import write_sharded_dataset
 
 write_sharded_dataset(
     df             = full_df,           # long-format DataFrame — must have 'available_mask'
@@ -400,7 +400,7 @@ When `mask is None` a plain `.mean()` is used — equivalent to a mask of all on
 
 ### Accuracy Metrics
 ```python
-from forgets.metrics.eval_losses import mae, mse, rmse, mape, smape
+from tsforge.metrics.eval_losses import mae, mse, rmse, mape, smape
 ```
 
 | Function | Formula |
@@ -437,7 +437,7 @@ print("RMSE:", rmse(preds, targets, mask))
 Stability metrics operate on the overlapping structure of forking sequences — multiple forecast windows predict the same target date from different horizons, so revisions across consecutive windows can be measured directly. Lower measurements are preferred.
 
 ```python
-from forgets.metrics.stability_metrics import excess_volatility, forecast_percentage_change
+from tsforge.metrics.stability_metrics import excess_volatility, forecast_percentage_change
 ```
 
 #### Excess Volatility (EV)
@@ -582,11 +582,11 @@ to limit aggregation to the N most recent overlaps.
 If you find this work useful, please cite:
 
 ```bibtex
-@misc{potosnak2026forgets,
-  title        = {ForgeTS},
+@misc{potosnak2026tsforge,
+  title        = {TSForge},
   author       = {Potosnak, Willa and Dubrawski, Artur},
   year         = {2026},
-  url={https://github.com/PotosnakW/ForgeTS}
+  url={https://github.com/PotosnakW/TSForge}
 }
 ```
 
