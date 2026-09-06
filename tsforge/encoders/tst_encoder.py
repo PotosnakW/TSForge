@@ -47,6 +47,31 @@ class TSTEncoder(nn.Module):
             ]
         )
         self.res_attention = config.res_attention
+        # context_len > 0 → cap lookback to exactly context_len (in patch
+        # units) so fcd_samples never changes what a single FCD can see.
+        # context_len == -1 is this codebase's "full context" convention
+        # (ForkingSequences, Transformer's assert) → unrestricted causal.
+        #
+        # KNOWN LIMITATION: this bounds the lookback of a single attention
+        # layer, not the whole stack's effective receptive field. With
+        # n_layers > 1, each additional layer can extend the true receptive
+        # field by up to (causal_len_token_num - 1) more patches (same
+        # reason a deeper CNN has a bigger receptive field per layer) — so
+        # a forecast's final representation can draw on somewhat more than
+        # context_len of history, roughly 1 + n_layers*(causal_len_token_num-1)
+        # patches in the worst case. This is bounded (unlike the pre-fix,
+        # unbounded-by-block/series-length behavior) but not exact. An
+        # exact fix would require either shrinking each layer's band so the
+        # composed reach equals context_len (a training-relevant
+        # architecture change, not just an inference tweak), or folding
+        # eval windows into the batch dimension in chunks sized to match
+        # training's own block_len (context_len + (fcd_samples-1)*stride)
+        # instead of running the whole series through one shared pass —
+        # see discussion in the PR/commit introducing this comment.
+        self.causal_len_token_num = (
+            int((config.context_len - config.patch_len) / config.stride + 1)
+            if config.context_len > 0 else None
+        )
 
     def forward(
         self,
@@ -61,6 +86,7 @@ class TSTEncoder(nn.Module):
         attention_mask = _make_causal_token_mask(
             key_padding_mask=key_padding_mask,
             device=x.device,
+            causal_len_token_num=self.causal_len_token_num,
         ).reshape(x.shape[0], 1, x.shape[1], x.shape[1])
     
         if self.res_attention:

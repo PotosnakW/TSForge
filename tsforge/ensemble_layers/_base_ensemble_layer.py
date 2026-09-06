@@ -5,15 +5,16 @@ class BaseEnsembleLayer:
         pass
 
     def get_ensemble_layer(self, config):
-        input_key = getattr(config, "input_layer", "none")
+        # Defaults to 'none' when unspecified — no config in configs/ sets this,
+        # so requiring it made every model unconstructible. Note this gates on
+        # ensemble_layer, NOT input_layer: keying the 'none' branch off
+        # input_layer meant a real input_layer always fell through to the
+        # ensembler branch (or an unreachable error), regardless of whether any
+        # ensembling was actually requested.
+        ensemble_key = getattr(config, "ensemble_layer", "none")
 
-        if input_key is None or str(input_key).lower() == "none":
-            print("No input layer selected — returning input as-is.")
+        if ensemble_key is None or str(ensemble_key).lower() == "none":
             return IdentityLayer()
-        elif config.ensemble_layer.lower() != "none":
-            from .ensembler_torch import Ensembler
-            return Ensembler(config)
-        else:
-            raise ValueError(
-                f"ensemble layer '{config.input_layer}' not recognised."
-            )
+
+        from .ensembler_torch import Ensembler
+        return Ensembler(config)

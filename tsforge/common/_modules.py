@@ -184,11 +184,23 @@ class Transpose(nn.Module):
 def _make_causal_token_mask(
     key_padding_mask: torch.Tensor,  # [B, C, L] — 1/True = VALID, 0/False = INVALID
     device: torch.device,
+    causal_len_token_num: int = None,
 ) -> torch.Tensor:
+    """
+    causal_len_token_num : int, optional
+        Caps each query's lookback to at most this many keys (itself
+        included) instead of the full causal history. Set to context_len
+        expressed in patch units so a shared encoder pass — training block
+        or the whole eval series — gives each forecast origin exactly
+        context_len worth of history, regardless of fcd_samples. None
+        keeps unrestricted causal attention.
+    """
     B, C, L = key_padding_mask.shape
 
     # Causal mask: [1, 1, 1, L, L] — 1 where attention is ALLOWED
     causal_mask = torch.ones(L, L, dtype=torch.float, device=device).tril()
+    if causal_len_token_num is not None and causal_len_token_num < L:
+        causal_mask = causal_mask - causal_mask.tril(diagonal=-causal_len_token_num)
     causal_mask = causal_mask.view(1, 1, 1, L, L)
 
     # Token validity: [B, C, 1, 1, L] — 1 = valid key, 0 = invalid key

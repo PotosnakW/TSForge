@@ -28,6 +28,13 @@ val_check_interval: 10      # run validation every N steps
 early_stopping_patience: 10   # number of val checks without improvement before stopping
 learning_rate: 1e-4
 fcd_samples: 10 # 1 for windows-sampling and >1 for forking-sequences
+fcd_samples_eval: null # Two modes only:
+                       #   null: mirror fcd_samples, so eval blocks have the
+                       #         same geometry as training blocks (exact match).
+                       #   -1:   whole series in one shared encoder pass —
+                       #         faster, but later windows draw on more history
+                       #         than any training block held.
+                       # Any other value is rejected.
 fcd_sampler: heterogeneous
 loss: "quantile"
 quantiles: [0.1, 0.5, 0.9]

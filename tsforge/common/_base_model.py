@@ -85,6 +85,13 @@ class BaseModel(nn.Module):
         Default: MSE against outsample_y. Override for custom losses.
     """
 
+    #: Whether this architecture reads a fixed context window. Windowed models
+    #: default norm_window_size to context_len, so normalization spans the same
+    #: history the model attends to. Models that carry unbounded state
+    #: (recurrent, conv) default to -1 (causal cumulative) instead. Subclasses
+    #: override; see Transformer.
+    WINDOWED_CONTEXT = False
+
     def __init__(self, config):
         super().__init__()
         self._training_ready = False
@@ -97,6 +104,19 @@ class BaseModel(nn.Module):
             eps=1e-5
         )
         
+        # Normalization window. Unspecified → follow the architecture: a
+        # windowed model normalizes over the same span it attends to
+        # (context_len); a model with unbounded state uses causal cumulative
+        # stats (-1). Note context_len is always set by
+        # DataLoaderFactory._resolve_context_len, including for recurrent
+        # models, so WINDOWED_CONTEXT — not "is context_len == -1" — is what
+        # distinguishes them.
+        norm_window_size = getattr(config, "norm_window_size", None)
+        if norm_window_size is None:
+            ctx = getattr(config, "context_len", -1)
+            norm_window_size = ctx if (self.WINDOWED_CONTEXT and ctx != -1) else -1
+        self.norm_window_size = norm_window_size
+
         self.fcd_samples = config.fcd_samples
         self._fork_sequences_train = ForkingSequences(
             context_len = config.context_len,
@@ -104,14 +124,57 @@ class BaseModel(nn.Module):
             patch_len = config.patch_len,
             stride = config.stride,
             fcd_sampler = config.fcd_sampler,
-            norm_window_size = config.norm_window_size
+            norm_window_size = norm_window_size
         )
+        # Eval block size — exactly two sanctioned modes:
+        #   None (default) → mirror fcd_samples, so every eval block has the
+        #                    same geometry the model saw at train time.
+        #   -1             → the whole series in one shared encoder pass.
+        #                    Fastest, but a window late in the series draws on
+        #                    more history than any training block held.
+        # Any other value is rejected: it would neither match training nor be
+        # maximally efficient, just wrong by an unquantified amount.
+        fcd_samples_eval = getattr(config, "fcd_samples_eval", None)
+        if fcd_samples_eval is None:
+            fcd_samples_eval = config.fcd_samples
+
+        if fcd_samples_eval != -1:
+            if not isinstance(fcd_samples_eval, int) or fcd_samples_eval < 1:
+                raise ValueError(
+                    f"fcd_samples_eval must be null, -1, or a positive int equal "
+                    f"to fcd_samples ({config.fcd_samples}); got {fcd_samples_eval!r}."
+                )
+            if fcd_samples_eval != config.fcd_samples:
+                raise ValueError(
+                    f"fcd_samples_eval={fcd_samples_eval} does not match "
+                    f"fcd_samples={config.fcd_samples}. Eval blocks must have the "
+                    "same geometry as the training blocks the model was fit on. "
+                    "Use null (mirror training) or -1 (whole series in one pass, "
+                    "faster but sees more history than training did)."
+                )
+
+        self.fcd_samples_eval = fcd_samples_eval
+
+        # Only a mismatch is worth warning about: when training itself used
+        # fcd_samples=-1 (all FCDs, whole series in one pass), evaluating with
+        # -1 IS the exact match, not a deviation from it.
+        if fcd_samples_eval == -1 and config.fcd_samples != -1:
+            logger.warning(
+                f"fcd_samples_eval=-1 with fcd_samples={config.fcd_samples}: "
+                "evaluating with the whole series in one shared encoder pass. "
+                "Windows late in a series draw on more history than any "
+                "training block contained, so forecasts will not exactly "
+                "reproduce the model's training-time behavior. Use null for an "
+                "exact match."
+            )
+
         self._fork_sequences_eval = ForkingSequences(
             context_len = config.context_len,
-            fcd_samples = -1,
+            fcd_samples = fcd_samples_eval,
             patch_len = config.patch_len,
             stride = config.stride,
-            norm_window_size = config.norm_window_size
+            norm_window_size = norm_window_size,
+            blocked = fcd_samples_eval != -1,
         )
 
         loss_fn = get_loss(config.loss)
@@ -196,7 +259,7 @@ class BaseModel(nn.Module):
         if self.training:
             fcd_samples = self._get_fcd_samples()
             return self._fork_sequences_train(raw_batch, horizon, fcd_samples=fcd_samples)
-        return self._fork_sequences_eval(raw_batch, horizon)
+        return self._fork_sequences_eval(raw_batch, horizon, fcd_samples=self.fcd_samples_eval)
 
 
     def _get_fcd_samples(self):
@@ -264,6 +327,23 @@ class BaseModel(nn.Module):
         outsample_mask = batch.get("outsample_mask")
         if outsample_mask is not None:
             outsample_mask = outsample_mask.cpu()
+
+        # Blocked eval folds blocks into the batch dim; restore the original
+        # [B, n_fcds, ...] layout (dropping the trailing block's padded FCDs)
+        # so predict() sees exactly the same shapes either way.
+        n_blocks = batch.get("n_blocks", 1)
+        if n_blocks > 1:
+            n_fcds = batch["n_fcds"]
+
+            def _unfold_blocks(t):
+                if t is None:
+                    return None
+                B = t.shape[0] // n_blocks
+                return t.reshape(B, n_blocks * t.shape[1], *t.shape[2:])[:, :n_fcds]
+
+            preds = _unfold_blocks(preds)
+            targets = _unfold_blocks(targets)
+            outsample_mask = _unfold_blocks(outsample_mask)
 
         return dict(preds=preds, targets=targets, outsample_mask=outsample_mask)
 

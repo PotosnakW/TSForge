@@ -54,6 +54,19 @@ def _unfold_windows(src: Tensor, size: int, step: int) -> Tensor:
     return unfolded.permute(*order).contiguous()   # [B, n_fcds, size, C, *extra]
 
 
+def _pad_right(src: Tensor, n_pad: int) -> Tensor:
+    """
+    Append `n_pad` zero timesteps to the time dim of [B, T, ...].
+
+    Used by the blocked eval strategy so the trailing block — which runs past
+    the end of the series whenever n_fcds isn't a multiple of the block size —
+    reads real (zero, masked-out) entries instead of an out-of-range index.
+    """
+    return torch.cat(
+        [src, src.new_zeros(src.shape[0], n_pad, *src.shape[2:])], dim=1
+    )
+
+
 def n_valid_fcds(T: int, context_len: int, horizon: int, stride: int) -> int:
     """
     How many complete FCD windows fit in a series of length T.
@@ -123,6 +136,7 @@ class ForkingSequences:
         stride: int = 1,
         fcd_sampler: str = "heterogeneous",
         norm_window_size: int = -1,
+        blocked: bool = False,
     ):
         if fcd_sampler not in self.SAMPLERS:
             raise ValueError(
@@ -133,13 +147,22 @@ class ForkingSequences:
         self.stride = stride
         self.norm_window_size = norm_window_size
         self.causal_stats = None
+        self.blocked = blocked
         self.fcd_sampler = (
             self._heterogeneous_sampler
             if fcd_sampler == "heterogeneous"
             else self._homogeneous_sampler
         )
 
-        if context_len != -1 and fcd_samples != -1:
+        if blocked:
+            if context_len == -1 or fcd_samples == -1:
+                raise ValueError(
+                    "blocked=True requires a fixed context_len and a positive "
+                    f"fcd_samples, got context_len={context_len}, "
+                    f"fcd_samples={fcd_samples}."
+                )
+            self._strategy = self._blocked_fcds_fixed_context
+        elif context_len != -1 and fcd_samples != -1:
             self._strategy = self._sampled_fcds_fixed_context
         elif context_len != -1 and fcd_samples == -1:
             self._strategy = self._all_fcds_fixed_context
@@ -317,8 +340,88 @@ class ForkingSequences:
         
         return enc_block, mask_block, loss_mask_block, window_size, fcd_samples, window_start
 
+    def _blocked_fcds_fixed_context(
+        self,
+        batch: Dict[str, Tensor],
+        horizon: int,
+        fcd_samples: int,
+    ) -> Dict[str, Tensor]:
+        """
+        Fixed context length, all valid windows — but chunked into blocks
+        shaped exactly like a training block and folded into the batch
+        dimension.
+
+        `_all_fcds_fixed_context` hands the encoder the whole series in one
+        shared pass, so a window late in the series can draw on far more
+        history than any training block ever contained (bounded only by the
+        series length). This covers the same FCDs, but each block spans only
+        block_len = L + (fcd_samples-1)*stride + H — the identical geometry
+        `_sampled_fcds_fixed_context` produces at train time — so the
+        encoder never sees a longer sequence at eval than it did at train.
+
+        Compute is still shared *within* a block (one pass covers
+        fcd_samples origins); it is not shared across block boundaries.
+
+        Blocks tile the FCD axis: block j covers FCDs
+        [j*fcd_samples, (j+1)*fcd_samples). The trailing block is right-padded
+        with masked-out zeros; those padded FCDs are additionally zeroed out of
+        outsample_mask in __call__, since an FCD straddling the boundary has
+        real context but an incomplete horizon and so isn't a valid window.
+        """
+        x_enc_full     = batch["x_enc"]           # [B, T, C, 1+Vh]
+        available_mask = batch["available_mask"]  # [B, T, C]
+        loss_mask      = batch["loss_mask"]
+
+        B, T, C, X1 = x_enc_full.shape
+        L, H = self.context_len, horizon
+        device = x_enc_full.device
+
+        n_fcds = (T - L - H) // self.stride + 1
+        if n_fcds < 1:
+            raise ValueError(
+                f"Series length {T} is too short for context_len={L} + "
+                f"horizon={H}: no valid FCD windows."
+            )
+
+        n_blocks  = (n_fcds + fcd_samples - 1) // fcd_samples   # ceil
+        block_len = L + (fcd_samples - 1) * self.stride + H
+
+        starts  = torch.arange(n_blocks, device=device) * fcd_samples * self.stride
+        offsets = torch.arange(block_len, device=device)
+
+        # n_fcds rarely divides evenly by fcd_samples, so the trailing block
+        # runs past the end of the series. Right-pad rather than clamping the
+        # gather index: padded rows are real entries carrying available_mask=0
+        # and loss_mask=0, so attention masking and _compute_norm_stats exclude
+        # them on their own — where a clamp would silently duplicate the last
+        # real timestep's value instead.
+        n_pad = max(0, int(starts[-1].item()) + block_len - T)
+        if n_pad:
+            x_enc_full     = _pad_right(x_enc_full, n_pad)
+            available_mask = _pad_right(available_mask, n_pad)
+            loss_mask      = _pad_right(loss_mask, n_pad)
+
+        # One gather builds every block: the index is [n_blocks, block_len],
+        # so the full series is never materialized once per block.
+        idx  = starts.unsqueeze(1) + offsets.unsqueeze(0)   # [n_blocks, block_len]
+        flat = idx.reshape(-1).unsqueeze(0).expand(B, -1)   # [B, n_blocks*block_len]
+
+        enc_block = x_enc_full.gather(
+            1, flat.unsqueeze(-1).unsqueeze(-1).expand(B, flat.shape[1], C, X1)
+        ).reshape(B * n_blocks, block_len, C, X1)
+
+        mask_flat = flat.unsqueeze(-1).expand(B, flat.shape[1], C)
+        mask_block = available_mask.gather(1, mask_flat).reshape(B * n_blocks, block_len, C)
+        loss_mask_block = loss_mask.gather(1, mask_flat).reshape(B * n_blocks, block_len, C)
+
+        # b-major, block-minor — matches the reshapes above and the
+        # channel_mask repeat_interleave in __call__
+        window_start = starts.unsqueeze(0).expand(B, n_blocks).reshape(-1)   # [B*n_blocks]
+
+        return enc_block, mask_block, loss_mask_block, L + H, fcd_samples, window_start
+
     def _all_fcds_fixed_context(
-        self, 
+        self,
         batch: Dict[str, Tensor],
         horizon: int,
         **_,
@@ -393,7 +496,13 @@ class ForkingSequences:
         loss_mask_block = loss_mask[:, :block_end]
         window_size = block_end - (fcd_samples - 1) * self.stride
 
-        return enc_block, mask_block, loss_mask_block, window_size, fcd_samples, window_start
+        # window_start is INTERNAL here — it only picks block_end. enc_block is
+        # the 0-based prefix x_enc_full[:, :block_end], not a block gathered at
+        # window_start (that's _sampled_fcds_fixed_context), so handing it back
+        # would make __call__ offset its stats lookup by it and read past the
+        # end of the series. None is how the other 0-based strategies say
+        # "my block starts at 0".
+        return enc_block, mask_block, loss_mask_block, window_size, fcd_samples, None
 
     def _all_fcds_full_context(
         self, 
@@ -444,47 +553,91 @@ class ForkingSequences:
         outsample_mask = loss_mask_windows[:, :, eff_L:, :]
         enc_size = enc_block.shape[1] - horizon
 
+        # ── Normalization stats ──
+        # Computed over the FULL series before any windowing — the blocked
+        # strategy folds blocks into the batch dim, but stats must still be
+        # cumulative over all real history the way training computes them,
+        # not restart at each block boundary.
+        x_full = batch["x_enc"]
+        avail_full = batch["available_mask"]
+        B, S = x_full.shape[:2]
+
+        # 1 for every non-blocked strategy; B*n_blocks rows otherwise
+        n_blocks = enc_block.shape[0] // B
+
+        if window_start is not None:
+            ws = window_start.reshape(B, n_blocks)          # [B, n_blocks]
+        else:
+            ws = torch.zeros(B, n_blocks, dtype=torch.long, device=x_full.device)
+
+        # The blocked strategy right-pads its trailing block; mirror that here
+        # so the stats source spans the same range. Padded rows carry
+        # available_mask=0, so _compute_norm_stats leaves the cumulative
+        # counts untouched and real positions are unaffected.
+        need = int(ws.max().item()) + enc_size
+        if need > S:
+            x_full = _pad_right(x_full, need - S)
+            avail_full = _pad_right(avail_full, need - S)
+
+        mask_full = avail_full.unsqueeze(-1).expand_as(x_full)
+        stats = self._compute_norm_stats(x_full, mask_full)
+        mean, stdev = stats['mean'], stats['stdev']
+
+        def _gather_stats(offsets: Tensor, n_out: int):
+            """
+            Gather [B*n_blocks, n_out, C, X+1] from [B, S, C, X+1] without
+            materializing a per-block copy of the full series: index in the
+            [B, n_blocks*n_out] layout, then reshape.
+            """
+            idx = ws.unsqueeze(-1) + offsets.view(1, 1, -1)
+            idx = idx.reshape(B, n_blocks * n_out)
+            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(B, n_blocks * n_out, *mean.shape[2:])
+            return (
+                mean.gather(1, idx).reshape(B * n_blocks, n_out, *mean.shape[2:]),
+                stdev.gather(1, idx).reshape(B * n_blocks, n_out, *stdev.shape[2:]),
+            )
+
+        # Per-timestep stats for norm
+        ts_offsets = torch.arange(enc_size, device=x_full.device)
+        ts_mean, ts_stdev = _gather_stats(ts_offsets, enc_size)
+
+        # Per-FCD stats for denorm/norm_targets
+        fcd_offsets = torch.arange(valid_fcds, device=x_full.device) * self.stride + eff_L - 1
+        fcd_mean, fcd_stdev = _gather_stats(fcd_offsets, valid_fcds)
+
+        channel_mask = batch['channel_mask']
+        if n_blocks > 1:
+            # b-major, block-minor — matches enc_block's reshape ordering
+            channel_mask = channel_mask.repeat_interleave(n_blocks, dim=0)
+
+            # The trailing block's padded slots aren't fully covered by the
+            # zero-padded loss_mask: an FCD straddling the boundary has real
+            # context and a partly-real horizon, so its mask comes out partly
+            # live even though it isn't a valid window. Zero those FCDs
+            # explicitly so they contribute neither loss nor forecasts.
+            n_fcds = (S - self.context_len - horizon) // self.stride + 1
+            fcd_ids = torch.arange(
+                n_blocks * valid_fcds, device=x_full.device
+            ).reshape(1, n_blocks, valid_fcds)
+            fcd_ok = (fcd_ids < n_fcds).expand(B, n_blocks, valid_fcds)
+            fcd_ok = fcd_ok.reshape(B * n_blocks, valid_fcds)
+            outsample_mask = outsample_mask * fcd_ok[:, :, None, None].to(outsample_mask.dtype)
+        else:
+            n_fcds = valid_fcds
+
         out = dict(
             insample_y=enc_block[:, :enc_size],
             outsample_y=enc_windows[:, :, eff_L:, :, 0],
             outsample_mask=outsample_mask,
             available_mask=mask_block[:, :enc_size],
-            channel_mask=batch['channel_mask'],
+            channel_mask=channel_mask,
             fcd_samples=valid_fcds,
             horizon=horizon,
+            n_blocks=n_blocks,
+            n_fcds=n_fcds,
         )
-
-        # ── Normalization stats ──
-        x_full = batch["x_enc"]
-        B, S = x_full.shape[:2]
-        mask_full = batch["available_mask"].unsqueeze(-1).expand_as(x_full)
-
-        stats = self._compute_norm_stats(x_full, mask_full)
-        mean, stdev = stats['mean'], stats['stdev']
-
-        # Per-timestep stats for norm
-        ts_offsets = torch.arange(enc_size, device=x_full.device)
-        if window_start is not None:
-            ts_indices = window_start.unsqueeze(1) + ts_offsets.unsqueeze(0)
-        else:
-            ts_indices = ts_offsets.unsqueeze(0).expand(B, -1)
-        ts_idx = ts_indices.unsqueeze(-1).unsqueeze(-1).expand(B, enc_size, *mean.shape[2:])
-        out["norm_stats"] = {
-            'mean': mean.gather(1, ts_idx),
-            'stdev': stdev.gather(1, ts_idx),
-        }
-
-        # Per-FCD stats for denorm/norm_targets
-        fcd_offsets = torch.arange(valid_fcds, device=x_full.device) * self.stride + eff_L - 1
-        if window_start is not None:
-            fcd_indices = window_start.unsqueeze(1) + fcd_offsets.unsqueeze(0)
-        else:
-            fcd_indices = fcd_offsets.unsqueeze(0).expand(B, -1)
-        fcd_idx = fcd_indices.unsqueeze(-1).unsqueeze(-1).expand(B, valid_fcds, *mean.shape[2:])
-        out["norm_fcd_stats"] = {
-            'mean': mean.gather(1, fcd_idx),
-            'stdev': stdev.gather(1, fcd_idx),
-        }
+        out["norm_stats"] = {'mean': ts_mean, 'stdev': ts_stdev}
+        out["norm_fcd_stats"] = {'mean': fcd_mean, 'stdev': fcd_stdev}
 
         return out
 

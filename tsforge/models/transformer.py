@@ -128,6 +128,9 @@ class Model(nn.Module):
         return full[:, window_offset:window_offset + n_windows].contiguous()
 
 class Transformer(BaseModel):
+    # Reads a fixed context window, so norm_window_size defaults to context_len
+    WINDOWED_CONTEXT = True
+
     def __init__(self, config):
         super().__init__(config)
 
